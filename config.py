@@ -14,6 +14,9 @@ def load_config(filename='database.ini', section='postgresql'):
     else:
         raise Exception('Section {0} not found in the {1} file'.format(section, filename))
 
+    config['SEND_FILE_MAX_AGE_DEFAULT'] = 100
+    config['MAX_CONTENT_LENGTH'] = 5000
+
     return config
 
 if __name__ == '__main__':
