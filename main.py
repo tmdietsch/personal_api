@@ -1,104 +1,80 @@
-from flask import Flask, Response, jsonify, make_response, request
+import datetime
+from re import sub
+from flask import Flask, Response, make_response, request
 from flask_cors import CORS
 from flask_restx import Api, Resource
-from flask_sqlalchemy import SQLAlchemy
+import psycopg2
 import werkzeug
 from config import load_config
-from sqlalchemy import desc, exc, select
-from werkzeug.middleware.proxy_fix import ProxyFix
 
 
 app = Flask(__name__)
 app.config = load_config()
-# app.wsgi_app = ProxyFix(app.wsgi_app)
+
+def connect(config):
+  """ Connect to the PostgreSQL database server """
+  try:
+    conn = psycopg2.connect(host='localhost',
+                            dbname='postgres',
+                            user='postgres',
+                            password='NCXLJ9VM')
+    return conn
+  except (psycopg2.DatabaseError, Exception) as error:
+    print("Error connecting to server: " + error.__str__())
+
 api = Api(app, version='1.0', title='My API', description='No touchy touchy', decorators=[])
-
-# cors = CORS(app, resources={r"/foo": {"origins": "*"}})
-# app.config['CORS_HEADERS'] = 'Content-Type'
 cors = CORS(app)
-
-db = SQLAlchemy(app)
+db = connect(app.config)
 
 STRING_FAIL = 'fail'
 STRING_SUCCESS = 'success'
 
-class Book(db.Model):
-  __tablename__ = "books"
-
-  id = db.Column(db.Integer, primary_key=True)
-  title = db.Column(db.String)
-  author = db.Column(db.String)
-  start_date = db.Column(db.Date)
-  end_date = db.Column(db.Date)
-  artwork = db.Column(db.String)
-  format_id = db.Column(db.ForeignKey("format.id"))
-  format = db.relationship('Format', foreign_keys=[format_id])
-  word_count = db.Column(db.Integer)
-
-  def serialize(self):
-    return ({
-      'id': self.id,
-      'title': self.title,
-      'author': self.author,
-      'startDate': self.start_date.strftime("%m/%d/%Y"),
-      'endDate': self.end_date.strftime("%m/%d/%Y") if self.end_date else 'Ongoing',
-      'artworkUrl': self.artwork,
-      'format': self.format.format_type,
-      'wordCount': self.word_count if self.word_count >= 0 else 'Still being written',
-    })
-
-
-class Format(db.Model):
-  __tablename__ = "format"
-
-  id = db.Column(db.Integer, primary_key=True)
-  format_type = db.Column(db.String)
 
 @app.route('/')
 def home():
-    resp = make_response('foo bar')
-    resp.headers['Access-Control-Allow-Headers'] = '*'
+  resp = make_response('foo bar')
+  resp.headers['Access-Control-Allow-Headers'] = '*'
 
 
 @api.route('/books')
 class BookView(Resource):
   def get(self):
-    books = db.session.scalars(
-      select(Book).order_by(Book.title)
-    )
-    response = [book.serialize() for book in books]
-    return response, 200
+    try:
+      response = query('SELECT * FROM books JOIN format ON books.format_id = format.id ORDER BY books.start_date desc;', db)
+      return response, 200
+    except Exception as error:
+      print('Error: ' + error.__str__())
+      return [], 404
   
   def post(self):
     data = request.json
-    newBook = Book(
-        title=data['title'],
-        author=data['author'],
-        start_date=data['startDate'],
-        end_date=data['endDate'],
-        artwork=data['artworkUrl'],
-        format_id=data['formatId'],
-        word_count=data['wordCount']
-    )
 
-    db.session.add(newBook)
-    db.session.commit()
+    try: 
+      my_tuple = (data['title'], data['author'], data['startDate'], data['endDate'], data['artworkUrl'], data['formatId'], data['wordCount'], None)
+
+      insert("""INSERT INTO books (title, author, start_date, end_date, artwork, format_id, word_count, series_id) 
+             VALUES (%s, %s, %s, %s, %s, %s, %s, %s);""", 
+             my_tuple,
+             db)
+    except Exception as error:
+      print(error)
+      return {'message': 'Fail'}, 404
 
     return {'message': 'Success'}, 200
   
   def delete(self):
-      pass
+    pass
     
 
 @api.route('/formats')
 class FormatView(Resource):
   def get(self):
-    formats = db.session.scalars(
-        select(Format)
-    )
-
-    response = [{ 'id': format.id, 'type': format.format_type } for format in formats]
-    return make_response(jsonify(response), 200)
+    try:
+      response = query('SELECT * FROM format', db)
+      return response, 200
+    except Exception as error:
+      print(error)
+      return [], 404
 
 
 @app.route('/favicon.ico')
@@ -112,15 +88,6 @@ def not_found(e):
 
 
 # -------------------- Helpers -------------------------
-def session_commit():
-	try :
-		db.session.commit()
-		return jsonify(meta = STRING_SUCCESS)
-	except exc.IntegrityError:
-		print ("IntegrityError while adding new user")
-		db.session.rollback()
-		return jsonify(meta = STRING_FAIL)
-
 @app.after_request
 def apply_headers(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
@@ -134,7 +101,50 @@ def handle_preflight():
         res.headers['Access-Control-Allow-Headers'] = '*'
         res.headers['Access-Control-Allow-Methods'] = 'GET,OPTIONS,POST,DELETE'
         return res
+    
+def get_column_names(cursor):
+   return [desc[0] for desc in cursor.description]
+
+def clean_input(col_names, data):
+  response = [ { n: p for p, n in zip(d, col_names) } for d in data]
+
+  result = []
+  for d in data:
+    clean_data = {}
+    for n, p in zip(col_names, d):
+      if isinstance(p, datetime.date):
+        p = p.strftime("%m/%d/%Y")
+      clean_data[camel_case(n)] = p
+    result.append(clean_data)
+
+  return result
+
+def query(stmt, database):
+  cur = database.cursor()
+  cur.execute(stmt)
+  data = cur.fetchall()
+
+  names = get_column_names(cur)
+  response = clean_input(names, data)
+
+  cur.close()
+
+  return response
+
+def insert(stmt, data, database):
+  cur = database.cursor()
+  cur.execute(stmt, data)
+
+  database.commit()
+
+def camel_case(s):
+  # Use regular expression substitution to replace underscores and hyphens with spaces,
+  # then title case the string (capitalize the first letter of each word), and remove spaces
+  s = sub(r"(_|-)+", " ", s).title().replace(" ", "")
+  
+  # Join the string, ensuring the first letter is lowercase
+  return ''.join([s[0].lower(), s[1:]])
 
 # -------------------- Startup -------------------------
 if __name__ == '__main__':
-  app.run(host='localhost', debug=True)
+  app.run(host='0.0.0.0', debug=True)
